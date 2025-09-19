@@ -56,11 +56,16 @@ def _probe_nvidia_smi() -> bool:
 
 
 _HAS_NVIDIA_SMI = _probe_nvidia_smi()
-DEVICE = "cuda" if _HAS_NVIDIA_SMI else "cpu"
+_DEFAULT_DEVICE = "cuda" if _HAS_NVIDIA_SMI else "cpu"
 WHISPER_MODEL_CPU = os.getenv("WHISPER_MODEL_CPU", "small")
 WHISPER_MODEL_CUDA = os.getenv("WHISPER_MODEL_CUDA", "medium")
-WHISPER_MODEL_NAME = WHISPER_MODEL_CUDA if DEVICE == "cuda" else WHISPER_MODEL_CPU
-COMPUTE_TYPE = "int8_float16" if DEVICE == "cuda" else "int8"
+
+
+def _normalize_device_name(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    normalized = value.strip().lower()
+    return normalized if normalized in {"cpu", "cuda"} else ""
 
 SUPPORTED_UPLOAD_TYPES = [
     "wav",
@@ -177,6 +182,13 @@ def ensure_state() -> None:
         "tasks": [],
         "lang_hint": "auto",
         "llm_meta": {"mode": "", "url": "", "model": ""},
+        "whisper_meta": {
+            "device": "",
+            "compute_type": "",
+            "model": "",
+            "fallback": False,
+        },
+        "whisper_force_device": "",
         "metrics": {
             "extract_audio_ms": None,
             "asr_ms": None,
@@ -834,6 +846,17 @@ def render_metrics() -> None:
         st.caption(
             f"LLM режим: {meta.get('mode', '-')}, модель: {meta.get('model', '-')}, URL: {meta.get('url')}"
         )
+    whisper_meta = st.session_state.get('whisper_meta', {})
+    if whisper_meta.get('device'):
+        note = ' (авто-переключение на CPU)' if whisper_meta.get('fallback') else ''
+        st.caption(
+            "Whisper: устройство {device}, тип вычислений {ctype}, модель {model}{note}".format(
+                device=whisper_meta.get('device', '-'),
+                ctype=whisper_meta.get('compute_type', '-'),
+                model=whisper_meta.get('model', '-'),
+                note=note,
+            )
+        )
 
 @st.cache_resource(show_spinner=True)
 def load_whisper(model_name: str, device: str, compute_type: str) -> WhisperModel:
@@ -843,15 +866,61 @@ def load_whisper(model_name: str, device: str, compute_type: str) -> WhisperMode
 apply_theme()
 ensure_state()
 
+env_device = _normalize_device_name(os.getenv("WHISPER_DEVICE"))
+forced_device = _normalize_device_name(st.session_state.get("whisper_force_device"))
+device = env_device or forced_device or _DEFAULT_DEVICE
+compute_type = "int8_float16" if device == "cuda" else "int8"
+model_name = WHISPER_MODEL_CUDA if device == "cuda" else WHISPER_MODEL_CPU
+
 if WhisperModel is None:
     st.error('faster-whisper не установлен')
     st.stop()
 
+whisper_meta: Dict[str, Any] = {
+    "device": device,
+    "compute_type": compute_type,
+    "model": model_name,
+    "fallback": False,
+}
+
 try:
-    whisper_model = load_whisper(WHISPER_MODEL_NAME, DEVICE, COMPUTE_TYPE)
+    whisper_model = load_whisper(model_name, device, compute_type)
 except Exception as exc:
-    st.error(f'Не удалось загрузить модель Whisper: {exc}')
-    st.stop()
+    if device != "cpu":
+        fallback_device = "cpu"
+        fallback_compute_type = "int8"
+        fallback_model_name = WHISPER_MODEL_CPU
+        try:
+            whisper_model = load_whisper(
+                fallback_model_name, fallback_device, fallback_compute_type
+            )
+        except Exception as cpu_exc:
+            st.error(
+                "Не удалось загрузить модель Whisper: GPU-режим завершился ошибкой "
+                f"({exc}). Попытка запуска на CPU также провалилась ({cpu_exc})."
+            )
+            st.stop()
+        else:
+            st.session_state["whisper_force_device"] = "cpu"
+            st.warning(
+                "Whisper переключён на CPU (int8) из-за ошибки при запуске на CUDA: "
+                f"{exc}.\n"
+                "Чтобы всегда использовать CPU, задайте переменную окружения WHISPER_DEVICE=cpu."
+            )
+            device = fallback_device
+            compute_type = fallback_compute_type
+            model_name = fallback_model_name
+            whisper_meta = {
+                "device": device,
+                "compute_type": compute_type,
+                "model": model_name,
+                "fallback": True,
+            }
+    else:
+        st.error(f'Не удалось загрузить модель Whisper: {exc}')
+        st.stop()
+
+st.session_state["whisper_meta"] = whisper_meta
 
 st.title('Whisper → LLaMA → Jira')
 render_metrics()
