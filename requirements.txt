@@ -1,5 +1,0 @@
-streamlit
-faster-whisper
-imageio-ffmpeg
-requests
-dateparser
